@@ -224,13 +224,6 @@ void cleanup_openssl() {
     EVP_cleanup();
 }
 
-static void help(void)
-{
-	printf("Usage ./dice_app");
-	printf("-m <mac addr> -b <bootloader hash> -c <code hash> -o <output cert>\n");
-	printf("Buffer format xx:yy:zz:...\n");
-}
-
 static int to_array(char *src, uint8_t arr[], int num)
 {
 	int i = 0;

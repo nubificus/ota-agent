@@ -6,16 +6,16 @@ src = $(wildcard src/*.c)
 obj = $(src:.c=.o)
 dep = $(obj:.o=.d)
 
-all: dice_app
+all: ota-agent
 
-.PHONY = dice_app
-dice_app: $(obj)
+.PHONY = ota-agent
+ota-agent: $(obj)
 	make -C mbedtls -j$(nproc) && \
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) -o ota-agent $^ $(LDFLAGS)
 
 -include $(dep)
 
 .PHONY: clean
 clean:
-	rm -f $(obj) $(dep) dice_app && \
+	rm -f $(obj) $(dep) ota-agent && \
 		 make -C mbedtls clean
