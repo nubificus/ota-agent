@@ -56,7 +56,9 @@ typedef struct {
 	size_t len;
 } cert_t;
 
-jmp_buf env;
+device_info *devices;
+int device_count;
+
 int server_fd;
 SSL_CTX *ctx;
 
@@ -334,28 +336,7 @@ int is_verified(const char *cert,
 	return 1;
 }
 
-device_info *devices;
-int device_count;
-
-SSL *verified_boards[MAX_CLIENTS];
-int client_fds[MAX_CLIENTS];
-size_t n_verified_boards = 0;
-
-void add_verified_board(SSL *ssl, int client_fd) {
-	verified_boards[n_verified_boards] = ssl;
-	client_fds[n_verified_boards++] = client_fd;
-}
-
-void cleanup_verified_boards() {
-	for (int i = 0; i < n_verified_boards; i++) {
-		SSL_free(verified_boards[i]);
-		close(client_fds[i]);
-	}
-	n_verified_boards = 0;
-}
-
-int apply_ota() {
-	printf("-------\n-------\nApplying OTA Update...\n");
+void apply_ota(SSL *ssl) {
 	int bytes_read;
 	int ret;
 	char buffer[64] = {0};
@@ -366,39 +347,23 @@ int apply_ota() {
 		exit(0);
 	}
 
-	for (int i = 0; i < n_verified_boards; i++) {
-		printf("Writing to verified board %d: %s\n", i, MSG_UPDATE_REQ);
-		ret = SSL_write(verified_boards[i], MSG_UPDATE_REQ, LEN_MSG_UPDATE_REQ);
+	fseek(file, 0, SEEK_SET);
+	while ((bytes_read = fread(buffer, 1, 64, file)) > 0) {
+		ret = SSL_write(ssl, buffer, bytes_read);
 		if (ret <= 0) {
-			printf("Could not send Update Request to client %d\n", ret);
+			printf("Could not send Update firmware-data to client %d\n", ret);
 			abort();
 		}
-
-		fseek(file, 0, SEEK_SET);
-		while ((bytes_read = fread(buffer, 1, 64, file)) > 0) {
-			ret = SSL_write(verified_boards[i], buffer, bytes_read);
-			if (ret <= 0) {
-				printf("Could not send Update firmware-data to client %d\n", ret);
-				abort();
-			}
-			memset(buffer, 0, 64);
-		}
+		memset(buffer, 0, 64);
 	}
-}
 
-void sig_ota_handle(int sig) {
-	printf("\nReceived OTA Request (%d)\n", sig);
-
-	apply_ota();
-
-	cleanup_verified_boards();
-	free_device_info(devices, device_count);
-	siglongjmp(env, 1);
+	int fd = SSL_get_fd(ssl);
+	SSL_free(ssl);
+	close(fd);
 }
 
 void sigint_handle(int sig) {
 	printf("Handling ^C Signal...\n");
-	cleanup_verified_boards();
 	free_device_info(devices, device_count);
 	close(server_fd);
 	SSL_CTX_free(ctx);
@@ -410,6 +375,17 @@ void sigint_handle(int sig) {
 	free(SERVER_KEY_PATH);
 
 	exit(0);
+}
+
+#define SUCCESS_BYTE "1"
+#define FAILURE_BYTE "0"
+
+int notify_auth_success(SSL *ssl) {
+	return SSL_write(ssl, SUCCESS_BYTE, 1);
+}
+
+int notify_auth_failure(SSL *ssl) {
+	return SSL_write(ssl, FAILURE_BYTE, 1);
 }
 
 void check_input_paths() {
@@ -452,10 +428,6 @@ void check_input_paths() {
 int main(int argc, char *argv[]) {
 	check_input_paths();
 
-	if (signal(SIGUSR1, sig_ota_handle) == SIG_ERR) {
-		printf("Error: Unable to catch OTA Request Signal (SIGUSR1)\n");
-		exit(1);
-	}
 	if (signal(SIGINT, sigint_handle) == SIG_ERR) {
 		printf("Error: Unable to catch SIGINT\n");
 		exit(1);	
@@ -501,22 +473,6 @@ int main(int argc, char *argv[]) {
 
 	struct sockaddr_in client_addr;
 	socklen_t len = sizeof(client_addr);
-
-	if (sigsetjmp(env, 1) == 0) {
-		/*
-		 *
-		 * Initial setjmp call: 
-		 * - Save process-context 
-		 * - We can start from here 
-		 *   when we call `siglongjmp()`
-		 *   with the saved `env` variable 
-		 *   
-		 */
-		printf("Starting the server...\n");
-	} else {
-		/* Code executed after siglongjmp */
-		printf("Restarting again after terminating the server...\n");
-	}
 
 	device_count = 0;
 	devices = read_device_info(DEV_INFO_PATH , &device_count);
@@ -578,18 +534,18 @@ int main(int argc, char *argv[]) {
 			printf("DER to PEM:\n%.50s\n", pem_buf);
 			#endif
 			if (is_verified((const char*) pem_buf, certs, device_count)) {
-				printf("Device verified\n");
-				int ret = SSL_write(ssl, MSG_SUCCESS, LEN_SUCCESS);	
+				int ret = notify_auth_success(ssl);
 				if (ret <= 0) {
 					printf("Could not send verification message\n");
 					SSL_free(ssl);
 					close(client_fd);
 					continue;
 				}
-				add_verified_board(ssl, client_fd);
+				printf("Device verified, about to update\n");
+				apply_ota(ssl);
 			} else {
 				printf("Not verified device\n");
-				int ret = SSL_write(ssl, MSG_FAIL, LEN_FAIL);
+				int ret = notify_auth_failure(ssl);
 				if (ret <= 0) {
 					printf("Could not send fail response\n");	
 				}
