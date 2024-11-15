@@ -543,6 +543,9 @@ int main(int argc, char *argv[]) {
 				}
 				printf("Device verified, about to update\n");
 				apply_ota(ssl);
+
+				printf("Update ended, raising ^C to myself\n");
+				kill(getpid(), SIGINT);
 			} else {
 				printf("Not verified device\n");
 				int ret = notify_auth_failure(ssl);
