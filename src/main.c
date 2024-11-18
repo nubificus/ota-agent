@@ -477,7 +477,7 @@ int main(int argc, char *argv[]) {
 	device_count = 0;
 	devices = read_device_info(DEV_INFO_PATH , &device_count);
 
-        if (devices) {
+        if (devices && device_count > 0) {
 		for (int i = 0; i < device_count; i++) {
 			printf("Device %d:\n", i + 1);
 			printf("  MAC: %s\n", devices[i].MAC);
