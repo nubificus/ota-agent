@@ -6,6 +6,22 @@
 #include <stdint.h>
 #include <dice/dice.h>
 
+#include <netdb.h>
+#include <arpa/inet.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h> 
+#include <unistd.h>
+#include <fcntl.h>
+
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/error.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -14,31 +30,12 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 
-#include <netdb.h>
-#include <arpa/inet.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <signal.h>
-#include <sys/types.h> 
-#include <unistd.h>
-#include <fcntl.h>
-#include <setjmp.h>
-
 #define PORT 4433
 #define MAX_LINE_LENGTH 1024
-#define MAX_CLIENTS 64
 #define DEBUG 0
 
-#define MSG_SUCCESS "1 Server: You are ___ verified\n"
-#define MSG_FAIL    "0 Server: You are NOT verified\n"
-
-#define LEN_SUCCESS strlen(MSG_SUCCESS)
-#define LEN_FAIL    strlen(MSG_FAIL)
-
-#define MSG_UPDATE_REQ "You are about to update\n"
-#define LEN_MSG_UPDATE_REQ strlen(MSG_UPDATE_REQ)
+#define SUCCESS_BYTE "1"
+#define FAILURE_BYTE "0"
 
 char *DEV_INFO_PATH;
 char *NEW_FIRMWARE_PATH;
@@ -58,9 +55,6 @@ typedef struct {
 
 device_info *devices;
 int device_count;
-
-int server_fd;
-SSL_CTX *ctx;
 
 cert_t make_cert(char *MAC, char *bootloader_hash, char *app_hash);
 
@@ -191,41 +185,6 @@ static char *base64_encode(const unsigned char *input, int length) {
         return buff;
 }
 
-void initialize_openssl() {
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
-}
-
-SSL_CTX* create_context() {
-    const SSL_METHOD *method = SSLv23_server_method();
-    ctx = SSL_CTX_new(method);
-    if (!ctx) {
-        perror("Unable to create SSL context");
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    return ctx;
-}
-
-void configure_context(SSL_CTX *ctx) {
-    // Load server certificate
-    if (SSL_CTX_use_certificate_file(ctx, SERVER_CRT_PATH, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    // Load server private key
-    if (SSL_CTX_use_PrivateKey_file(ctx, SERVER_KEY_PATH, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-}
-
-void cleanup_openssl() {
-    EVP_cleanup();
-}
-
 static int to_array(char *src, uint8_t arr[], int num)
 {
 	int i = 0;
@@ -336,8 +295,9 @@ int is_verified(const char *cert,
 	return 1;
 }
 
-void apply_ota(SSL *ssl) {
+void apply_ota(mbedtls_ssl_context *ssl) {
 	int bytes_read;
+	int total_bytes_sent = 0;
 	int ret;
 	char buffer[64] = {0};
 
@@ -346,46 +306,22 @@ void apply_ota(SSL *ssl) {
 		perror("Error: File opening failed");
 		exit(0);
 	}
-
+	fseek(file, 0, SEEK_END);
+	int filelen = ftell(file);
 	fseek(file, 0, SEEK_SET);
+
 	while ((bytes_read = fread(buffer, 1, 64, file)) > 0) {
-		ret = SSL_write(ssl, buffer, bytes_read);
+		ret = mbedtls_ssl_write(ssl, buffer, bytes_read);
 		if (ret <= 0) {
 			printf("Could not send Update firmware-data to client %d\n", ret);
 			abort();
 		}
+		total_bytes_sent += ret;
+		printf("\rSent: %d%%", (int) (100 * (double) total_bytes_sent / (double) filelen));
+		fflush(stdout);
 		memset(buffer, 0, 64);
 	}
-
-	int fd = SSL_get_fd(ssl);
-	SSL_free(ssl);
-	close(fd);
-}
-
-void sigint_handle(int sig) {
-	printf("Handling ^C Signal...\n");
-	free_device_info(devices, device_count);
-	close(server_fd);
-	SSL_CTX_free(ctx);
-	cleanup_openssl();
-
-	free(DEV_INFO_PATH);
-	free(NEW_FIRMWARE_PATH);
-	free(SERVER_CRT_PATH);
-	free(SERVER_KEY_PATH);
-
-	exit(0);
-}
-
-#define SUCCESS_BYTE "1"
-#define FAILURE_BYTE "0"
-
-int notify_auth_success(SSL *ssl) {
-	return SSL_write(ssl, SUCCESS_BYTE, 1);
-}
-
-int notify_auth_failure(SSL *ssl) {
-	return SSL_write(ssl, FAILURE_BYTE, 1);
+	printf("\n");
 }
 
 void check_input_paths() {
@@ -425,55 +361,12 @@ void check_input_paths() {
 		fprintf(stdout, "Reading server's private key from:  %s\n", SERVER_KEY_PATH);
         }
 }
+
 int main(int argc, char *argv[]) {
+	int ret;
 	check_input_paths();
 
-	if (signal(SIGINT, sigint_handle) == SIG_ERR) {
-		printf("Error: Unable to catch SIGINT\n");
-		exit(1);	
-	}
-
-	int server_fd;
-	struct sockaddr_in addr;
-
-	initialize_openssl();
-	SSL_CTX *ctx = create_context();
-	configure_context(ctx);
-
-	server_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (server_fd < 0) {
-		perror("socket failed");
-		exit(EXIT_FAILURE);
-	}
-	int option = 1;
-	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
-	
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(PORT);
-	addr.sin_addr.s_addr = INADDR_ANY;
-	
-	/* fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL, 0) & ~O_NONBLOCK); */
-
-	if (fcntl(server_fd, F_GETFL, 0) & ~O_NONBLOCK)
-		printf("Blocking mode enabled\n");
-	else
-		printf("Blocking mode disabled\n");
-
-	if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		perror("bind failed");
-		close(server_fd);
-		exit(EXIT_FAILURE);
-	}
-
-	if (listen(server_fd, 1) < 0) {
-		perror("listen failed");
-		close(server_fd);
-		exit(EXIT_FAILURE);
-	}
-
-	struct sockaddr_in client_addr;
-	socklen_t len = sizeof(client_addr);
-
+	/* Device info loading */
 	device_count = 0;
 	devices = read_device_info(DEV_INFO_PATH , &device_count);
 
@@ -499,27 +392,123 @@ int main(int argc, char *argv[]) {
 		 printf("%d. PEM Output:\n%.50s...\n", i, certs[i].cert);
 #endif
 
-	while (1) {
-		printf("Waiting for connections...\n");
+	const char *pers = "tls_server";
+	mbedtls_net_context listen_fd, client_fd;
+	mbedtls_ssl_context ssl;
+	mbedtls_ssl_config conf;
+	mbedtls_ctr_drbg_context ctr_drbg;
+	mbedtls_entropy_context entropy;
+	mbedtls_x509_crt cert;
+	mbedtls_pk_context key;
 
-		int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &len);
-		if (client_fd < 0) {
-			perror("accept failed");
+	mbedtls_net_init(&listen_fd);
+	mbedtls_net_init(&client_fd);
+	mbedtls_ssl_init(&ssl);
+	mbedtls_ssl_config_init(&conf);
+	mbedtls_ctr_drbg_init(&ctr_drbg);
+	mbedtls_entropy_init(&entropy);
+	mbedtls_x509_crt_init(&cert);
+	mbedtls_pk_init(&key);
+
+	/* Seed the random number generator */
+	if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func,
+					 &entropy, (const unsigned char *)pers,
+					 strlen(pers))) != 0) {
+		fprintf(stderr, "Failed to seed RNG: -0x%04X\n", -ret);
+		return -1;
+	}
+
+	/* Load SSL configuration */
+	if ((ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_SERVER,
+					       MBEDTLS_SSL_TRANSPORT_STREAM,
+					       MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+		fprintf(stderr, "Failed to set SSL configuration: -0x%04X\n", -ret);
+		return -1;
+	}
+
+	mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+
+	/* Load certificate */
+	if ((ret = mbedtls_x509_crt_parse_file(&cert, SERVER_CRT_PATH)) != 0) {
+		fprintf(stderr, "Failed to load server certificate: -0x%04X\n", -ret);
+		return -1;
+	}
+
+	/* Load private key */
+	if ((ret = mbedtls_pk_parse_keyfile(&key, SERVER_KEY_PATH,
+					    NULL, mbedtls_ctr_drbg_random,
+					    &ctr_drbg)) != 0) {
+		fprintf(stderr, "Failed to load server private key: -0x%04X\n", -ret);
+		return -1;
+	}
+
+	/* Configure key and certificate */
+	if ((ret = mbedtls_ssl_conf_own_cert(&conf, &cert, &key)) != 0) {
+		fprintf(stderr, "Failed to load certificate or key: -0x%04X\n", -ret);
+		return -1;
+	}
+
+	/* Bind and listen */
+	if ((ret = mbedtls_net_bind(&listen_fd, NULL, "4433",
+				    MBEDTLS_NET_PROTO_TCP)) != 0) {
+		fprintf(stderr, "Failed to bind to port 4433: -0x%04X\n", -ret);
+		return -1;
+	}
+
+	printf("Server is listening on port 4433\n");
+
+	while (1) {
+		printf("Waiting for a connection...\n");
+
+		/* Accept a connection */
+		if ((ret = mbedtls_net_accept(&listen_fd, &client_fd,
+					      NULL, 0, NULL)) != 0) {
+			fprintf(stderr, "Failed to accept connection: -0x%04X\n", -ret);
 			continue;
 		}
 
-		printf("Accepted - Client FD: %d\n", client_fd);
+		printf("Client connected\n");
 
-		SSL *ssl = SSL_new(ctx);
-		SSL_set_fd(ssl, client_fd);
-		SSL_accept(ssl);
+		/* Setup SSL context */
+		if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
+			fprintf(stderr, "Failed to setup SSL: -0x%04X\n", -ret);
+			mbedtls_net_free(&client_fd);
+			continue;
+		}
 
-		printf("TLS Established\n");
+		mbedtls_ssl_set_bio(&ssl, &client_fd, mbedtls_net_send,
+				    mbedtls_net_recv, NULL);
 
-		char client_msg[4096] = {0};
-		int bytes_read;
+		/* Perform handshake */
+		if ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+			fprintf(stderr, "Failed to perform SSL handshake: -0x%04X\n", -ret);
+			mbedtls_ssl_free(&ssl);
+			mbedtls_net_free(&client_fd);
+			continue;
+		}
 
-		bytes_read = SSL_read(ssl, client_msg, sizeof(client_msg) - 1);
+		printf("TLS connection established\n");
+
+		#if DEBUG
+		/* Debug information */
+		printf("Session Cipher Suite: %s\n", mbedtls_ssl_get_ciphersuite(&ssl));
+		printf("Protocol Version: %s\n", mbedtls_ssl_get_version(&ssl));
+		const mbedtls_x509_crt *peer_cert = mbedtls_ssl_get_peer_cert(&ssl);
+		if (peer_cert != NULL) {
+			char buf[1024];
+			mbedtls_x509_crt_info(buf, sizeof(buf) - 1, "    ", peer_cert);
+			printf("Peer Certificate Information:\n%s\n", buf);
+		} else {
+			printf("No peer certificate received.\n");
+		}
+		#endif
+
+		/* Read client message */
+		#define BUF_LEN 4096
+		unsigned char client_msg[BUF_LEN] = {0};
+
+		printf("About to receive the certificate..\n");
+		int bytes_read = mbedtls_ssl_read(&ssl, client_msg, BUF_LEN - 1);
 		if (bytes_read > 0) {
 			client_msg[bytes_read] = '\0';
 			
@@ -534,32 +523,43 @@ int main(int argc, char *argv[]) {
 			printf("DER to PEM:\n%.50s\n", pem_buf);
 			#endif
 			if (is_verified((const char*) pem_buf, certs, device_count)) {
-				int ret = notify_auth_success(ssl);
+				printf("Verified device\n");
+
+				int ret = mbedtls_ssl_write(&ssl, SUCCESS_BYTE, 1);
 				if (ret <= 0) {
 					printf("Could not send verification message\n");
-					SSL_free(ssl);
-					close(client_fd);
+					mbedtls_ssl_close_notify(&ssl);
+					mbedtls_ssl_free(&ssl);
+					mbedtls_net_free(&client_fd);
 					continue;
 				}
-				printf("Device verified, about to update\n");
-				apply_ota(ssl);
-
-				printf("Update ended, raising ^C to myself\n");
-				kill(getpid(), SIGINT);
+				printf("Device notified, starting sending data..\n");
+				apply_ota(&ssl);
+				printf("`apply_ota()` returned\n");
 			} else {
 				printf("Not verified device\n");
-				int ret = notify_auth_failure(ssl);
+				int ret = mbedtls_ssl_write(&ssl, FAILURE_BYTE, 1);
 				if (ret <= 0) {
-					printf("Could not send fail response\n");	
+					printf("Could not notify about auth-failure\n");	
 				}
-				SSL_free(ssl);
-				close(client_fd);
+				mbedtls_ssl_close_notify(&ssl);
+				mbedtls_ssl_free(&ssl);
+				mbedtls_net_free(&client_fd);
 			}
-			free(pem_buf);
+			free(pem_buf);	
 		} else {
-			int err = SSL_get_error(ssl, bytes_read);
-			printf("SSL_read failed with error code %d\n", err);
+			fprintf(stderr, "Failed to read from client: -0x%04X\n", -ret);
 		}
+
+		mbedtls_ssl_close_notify(&ssl);
+		mbedtls_net_free(&client_fd);
+		mbedtls_ssl_free(&ssl);
+		return 0;
 	}
+
+	mbedtls_net_free(&listen_fd);
+	mbedtls_ssl_config_free(&conf);
+	mbedtls_ctr_drbg_free(&ctr_drbg);
+	mbedtls_entropy_free(&entropy);
 	return 0;
 }
