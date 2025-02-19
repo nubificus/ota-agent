@@ -1,6 +1,6 @@
 INCLUDE_DIR = -Iinclude -Imbedtls/include
 CFLAGS = $(INCLUDE_DIR) -g #-Wall
-LDFLAGS  = -Lmbedtls/library/ -lmbedtls -lmbedx509 -lmbedcrypto -lssl -lcrypto
+LDFLAGS  = -Lmbedtls/library/ -lmbedtls -lmbedx509 -lmbedcrypto -lssl -lcrypto -lcurl
 
 src = $(wildcard src/*.c)
 obj = $(src:.c=.o)
