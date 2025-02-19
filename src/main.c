@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <dice/dice.h>
 
+#include <curl/curl.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 
@@ -30,92 +31,18 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 
-#define PORT 4433
-#define MAX_LINE_LENGTH 1024
-#define DEBUG 0
-
 #define SUCCESS_BYTE "1"
 #define FAILURE_BYTE "0"
+#define DICE_AUTH_FAIL -1
+#define DICE_AUTH_SUCCESS 0
 
-char *DEV_INFO_PATH;
+#define PORT 4433
+#define DEBUG 0
+
 char *NEW_FIRMWARE_PATH;
+char *DICE_AUTH_URL;
 char *SERVER_CRT_PATH;
 char *SERVER_KEY_PATH;
-
-typedef struct {
-	char *app_hash;
-	char *bootloader_hash;
-	char *MAC;
-} device_info;
-
-typedef struct {
-	unsigned char *cert;
-	size_t len;
-} cert_t;
-
-device_info *devices;
-int device_count;
-
-cert_t make_cert(char *MAC, char *bootloader_hash, char *app_hash);
-
-cert_t* certs_init(device_info* devs, size_t n_dev) {
-	cert_t *certs_arr = (cert_t*) malloc(n_dev * sizeof(cert_t));
-	for (int i = 0; i < n_dev; i++)
-		certs_arr[i] = make_cert(devs[i].MAC, devs[i].bootloader_hash, devs[i].app_hash);
-
-	return certs_arr;
-}
-
-device_info* read_device_info(const char *filename, int *count) {
-	FILE *file = fopen(filename, "r");
-        if (!file) {
-	        perror("Failed to open file");
-	        return NULL;
-	}
-
-	int capacity = 10;  // Starting capacity
-	device_info *devices = malloc(capacity * sizeof(device_info));
-	if (!devices) {
-		perror("Memory allocation failed");
-		fclose(file);
-		return NULL;
-	}
-	char line[MAX_LINE_LENGTH];
-         *count = 0;
-	 while (fgets(line, sizeof(line), file)) {
-		 if (*count >= capacity) {
-			 capacity *= 2;
-			 device_info *new_devices = realloc(devices, capacity * sizeof(device_info));
-			 if (!new_devices) {
-				 perror("Memory reallocation failed");
-				 free(devices);
-				 fclose(file);
-				 return NULL;
-			 }
-			 devices = new_devices;
-		 }
-		 devices[*count].MAC = strdup(strtok(line, " \t\n"));
-		 devices[*count].app_hash = strdup(strtok(NULL, " \t\n"));
-		 devices[*count].bootloader_hash = strdup(strtok(NULL, "  \t\n"));
-		 if (!devices[*count].MAC || !devices[*count].app_hash || !devices[*count].bootloader_hash) {
-			 perror("Error parsing line or allocating memory");
-			 free(devices);
-			 fclose(file);
-			 return NULL;
-		 }
-		 (*count)++;
-	 }
-	 fclose(file);
-	 return devices;
-}
-void free_device_info(device_info *devices, int count) {
-	for (int i = 0; i < count; i++) {
-		free(devices[i].MAC);
-		free(devices[i].app_hash);
-		free(devices[i].bootloader_hash);
-	}
-	free(devices);
-}
 
 int der_to_pem_buffer(const unsigned char *der_buf, size_t der_len, unsigned char **pem_buf, size_t *pem_len) {
     X509 *cert = NULL;
@@ -166,135 +93,6 @@ int der_to_pem_buffer(const unsigned char *der_buf, size_t der_len, unsigned cha
     return 0;
 }
 
-static char *base64_encode(const unsigned char *input, int length) {
-	BIO *bmem = NULL;
-	BIO *b64 = NULL;
-	BUF_MEM *bptr = NULL;
-
-	b64 = BIO_new(BIO_f_base64());
-        bmem = BIO_new(BIO_s_mem());
-        b64 = BIO_push(b64, bmem);
-        BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-        BIO_write(b64, input, length);
-        BIO_flush(b64);
-        BIO_get_mem_ptr(b64, &bptr);
-        char *buff = (char *)malloc(bptr->length + 1);
-        memcpy(buff, bptr->data, bptr->length);
-        buff[bptr->length] = 0;
-        BIO_free_all(b64);
-        return buff;
-}
-
-static int to_array(char *src, uint8_t arr[], int num)
-{
-	int i = 0;
-	char *token = strtok(src, ":");
-
-	while (token != NULL && i < num) {
-		sscanf(token, "%02hhx", &arr[i]);
-		token = strtok(NULL, ":");
-		i++;
-	}
-
-	return i;
-}
-
-cert_t make_cert(char *MAC, char *bootloader_hash, char *app_hash) {
-	//printf("Makecert -m %s\n-b %s\n-c %s\n", MAC, bootloader_hash, app_hash);
-	uint8_t seal_cdi_buffer[DICE_CDI_SIZE] = {0};
-	uint8_t cdi_buffer[DICE_CDI_SIZE] = {0};
-	DiceInputValues input_values = {0};
-	uint8_t cert_buffer[2048];
-	uint8_t mac_addr[6];
-	size_t cert_size;
-	DiceResult ret;
-	int opt, i;
-	FILE *fp;
-	uint8_t boot_hash[DICE_HASH_SIZE] = {0}, code_hash[DICE_HASH_SIZE] = {0};
-	uint8_t final_seal_cdi_buffer[DICE_CDI_SIZE] = {0};
-	uint8_t final_cdi_buffer[DICE_CDI_SIZE] = {0};
-	/*
-	 * This must be unique per device on hardware that supports it
-	 * On our ESP32 app, we hardcode the UDS. This has to match
-	 */
-	const uint8_t uds_buffer[] = {
-		0xDA, 0xDD, 0xAE, 0xBC, 0x80, 0x20, 0xDA, 0x9F, 0xF0, 0xDD, 0x5A,
-		0x24, 0xC8, 0x3A, 0xA5, 0xA5, 0x42, 0x86, 0xDF, 0xC2, 0x63, 0x03,
-		0x1E, 0x32, 0x9B, 0x4D, 0xA1, 0x48, 0x43, 0x06, 0x59, 0xFE, 0x62,
-		0xCD, 0xB5, 0xB7, 0xE1, 0xE0, 0x0F, 0xC6, 0x80, 0x30, 0x67, 0x11,
-		0xEB, 0x44, 0x4A, 0xF7, 0x72, 0x09, 0x35, 0x94, 0x96, 0xFC, 0xFF,
-		0x1D, 0xB9, 0x52, 0x0B, 0xA5, 0x1C, 0x7B, 0x29, 0xEA
-	};
-	i = to_array(MAC, mac_addr, sizeof(mac_addr));
-	if (i != sizeof(mac_addr)) {
-		printf("Invalid MAC\n");
-		exit(!EXIT_FAILURE);
-	}
-	i = to_array(bootloader_hash, boot_hash, sizeof(boot_hash));
-	i = to_array(app_hash, code_hash, sizeof(code_hash));
-
-#if DEBUG
-	printf("MAC %02x:%02x:%02x:%02x:%02x:%02x\n", mac_addr[0], mac_addr[1], mac_addr[2],
-	       mac_addr[3], mac_addr[4],  mac_addr[5]);
-	printf("Boot hash\n");
-	for (i = 0; i < sizeof(boot_hash); i++)
-		printf("%02x", boot_hash[i]);
-	printf("\n");
-	printf("Code hash\n");
-	for (i = 0; i < sizeof(code_hash); i++)
-		printf("%02x", code_hash[i]);
-	printf("\n");
-#endif
-
-	input_values.mode = kDiceModeNormal;
-	input_values.config_type = kDiceConfigTypeInline;
-	/* Mac is smaller that code_hash */
-	memcpy(input_values.config_value, mac_addr,
-	       sizeof(mac_addr));
-	memcpy(input_values.code_hash, boot_hash, sizeof(input_values.code_hash));
-
-	ret = DiceMainFlow(NULL, uds_buffer, uds_buffer, &input_values,
-			        0, NULL, NULL, cdi_buffer, seal_cdi_buffer);
-	if (ret != kDiceResultOk) {
-		printf("DICE first CDI failed!");
-		abort();
-	}
-
-	memset(input_values.code_hash, 0, sizeof(input_values.code_hash));
-	memcpy(input_values.code_hash, code_hash, sizeof(input_values.code_hash));
-	input_values.mode = kDiceModeNormal;
-	input_values.config_type = kDiceConfigTypeInline;
-	ret = DiceMainFlow(NULL, cdi_buffer, cdi_buffer,
-			   &input_values, sizeof(cert_buffer), cert_buffer,
-			   &cert_size, final_cdi_buffer, final_seal_cdi_buffer);
-
-	
-	unsigned char *pem_buf = NULL;
-	size_t pem_len = 0;
-	if (der_to_pem_buffer((const unsigned char *) cert_buffer,
-			      cert_size, &pem_buf, &pem_len) != 0) {
-		fprintf(stderr, "Conversion failed\n");
-		abort();
-	}
-	cert_t cert = {
-		.len = pem_len,
-		.cert = pem_buf
-	};
-
-	return cert;
-}
-
-int is_verified(const char *cert,
-		cert_t *verified_certs,
-		size_t n_certs)
-{
-	int i = 0;
-	while (strcmp(cert, verified_certs[i++].cert))
-		if (i == n_certs)
-			return 0;
-	return 1;
-}
-
 void apply_ota(mbedtls_ssl_context *ssl) {
 	int bytes_read;
 	int total_bytes_sent = 0;
@@ -334,13 +132,13 @@ void check_input_paths() {
 		fprintf(stdout, "Reading new firmware from:          %s\n", NEW_FIRMWARE_PATH);
 	}
 
-	char *dev_info_path = getenv("DEV_INFO_PATH");
-	if (dev_info_path == NULL) {
-		fprintf(stderr, "DEV_INFO_PATH is not set - Please set the path of the device-info file\n");
+	char *dice_auth_url = getenv("DICE_AUTH_URL");
+	if (dice_auth_url == NULL) {
+		fprintf(stderr, "DICE_AUTH_URL is not set - Please set the URL of the attestation server\n");
 		exit(0);
 	} else {
-		DEV_INFO_PATH = strdup(dev_info_path);
-		fprintf(stdout, "Reading device info from:           %s\n", DEV_INFO_PATH);
+		DICE_AUTH_URL = strdup(dice_auth_url);
+		fprintf(stdout, "Dice Attestation Server:            %s\n", DICE_AUTH_URL);
 	}
 
 	char *srv_crt_path = getenv("SERVER_CRT_PATH");
@@ -362,35 +160,49 @@ void check_input_paths() {
         }
 }
 
+int dice_auth_attest(const char *url, const char *pem) {
+	int ret = DICE_AUTH_FAIL;
+
+	/* Initialize libcurl */
+	CURL *curl = curl_easy_init();
+	if (!curl) {
+		fprintf(stderr, "Failed to initialize curl\n");
+		return ret;
+	}
+
+	struct curl_slist *headers = NULL;
+	headers = curl_slist_append(headers, "Content-Type: text/plain");
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, pem);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(pem));
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+	CURLcode res = curl_easy_perform(curl);
+	if (res != CURLE_OK) {
+		fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+	} else {
+		long http_code = 0;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+		if (http_code == 200) {
+			printf("HTTP response code is 200: OK\n");
+			ret = DICE_AUTH_SUCCESS;
+		} else {
+			printf("Unexpected HTTP response code: %ld\n", http_code);
+		}
+	}
+
+	/* Cleanup */
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+
+	return ret;
+}
+
 int main(int argc, char *argv[]) {
 	int ret;
 	check_input_paths();
-
-	/* Device info loading */
-	device_count = 0;
-	devices = read_device_info(DEV_INFO_PATH , &device_count);
-
-        if (devices && device_count > 0) {
-		for (int i = 0; i < device_count; i++) {
-			printf("Device %d:\n", i + 1);
-			printf("  MAC: %s\n", devices[i].MAC);
-
-			#if DEBUG
-			printf("  App Hash: %s\n", devices[i].app_hash);
-			printf("  Bootloader Hash: %s\n", devices[i].bootloader_hash);
-			#endif
-		}
-	} else {
-		printf("No devices parsed.\n");
-		exit(0);
-	}
-
-	cert_t* certs = certs_init(devices, device_count);
-	
-#if DEBUG
-	for (int i = 0; i < device_count; i++)
-		 printf("%d. PEM Output:\n%.50s...\n", i, certs[i].cert);
-#endif
 
 	const char *pers = "tls_server";
 	mbedtls_net_context listen_fd, client_fd;
@@ -522,7 +334,7 @@ int main(int argc, char *argv[]) {
 			#if DEBUG
 			printf("DER to PEM:\n%.50s\n", pem_buf);
 			#endif
-			if (is_verified((const char*) pem_buf, certs, device_count)) {
+			if (dice_auth_attest(DICE_AUTH_URL, (const char *)pem_buf) == DICE_AUTH_SUCCESS) {
 				printf("Verified device\n");
 
 				int ret = mbedtls_ssl_write(&ssl, SUCCESS_BYTE, 1);
