@@ -31,8 +31,6 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 
-#define SUCCESS_BYTE "1"
-#define FAILURE_BYTE "0"
 #define DICE_AUTH_FAIL -1
 #define DICE_AUTH_SUCCESS 0
 
@@ -93,11 +91,11 @@ int der_to_pem_buffer(const unsigned char *der_buf, size_t der_len, unsigned cha
     return 0;
 }
 
-void apply_ota(mbedtls_ssl_context *ssl) {
-	int bytes_read;
-	int total_bytes_sent = 0;
-	int ret;
-	char buffer[64] = {0};
+#define RETRY_DELAY_MS 500
+#define MAX_RETRY_TIME_MS 20000
+
+int send_fw(mbedtls_ssl_context *ssl) {
+        printf("Attemting to send the firmware..\n");
 
 	FILE *file = fopen(NEW_FIRMWARE_PATH, "r");
 	if (file == NULL) {
@@ -105,21 +103,74 @@ void apply_ota(mbedtls_ssl_context *ssl) {
 		exit(0);
 	}
 	fseek(file, 0, SEEK_END);
-	int filelen = ftell(file);
+	int len = ftell(file);
 	fseek(file, 0, SEEK_SET);
 
-	while ((bytes_read = fread(buffer, 1, 64, file)) > 0) {
-		ret = mbedtls_ssl_write(ssl, buffer, bytes_read);
-		if (ret <= 0) {
-			printf("Could not send Update firmware-data to client %d\n", ret);
-			abort();
-		}
-		total_bytes_sent += ret;
-		printf("\rSent: %d%%", (int) (100 * (double) total_bytes_sent / (double) filelen));
-		fflush(stdout);
-		memset(buffer, 0, 64);
+	void *buffer = malloc(len);
+	if (!buffer) {
+		printf("Could not malloc for the firmware image\n");
+		return -1;
 	}
-	printf("\n");
+
+	if (len > fread(buffer, 1, len, file)) {
+		printf("Could not read the firmware file\n");
+		return -1;
+	}
+
+        int total_sleep_time = 0;
+        int bytes_sent = 0;
+
+        while (bytes_sent < len) {
+                const unsigned char *read_from = buffer + bytes_sent;
+                int nr_bytes = len - bytes_sent;
+                int ret = mbedtls_ssl_write(ssl, read_from, nr_bytes);
+
+                if (ret > 0) {
+			bytes_sent += ret;
+			printf("\rSent: %d%%", (int) (100 * (double) bytes_sent / (double) len));
+			fflush(stdout);
+			total_sleep_time = 0;
+			continue;
+		}
+
+		/* Handle errors */
+		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+			printf("Connection closed before sending the new firmware\n");
+			free(buffer);
+			return -1;
+		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+			#if DEBUG
+			fprintf(stderr, "mbedtls_ssl_write() wants read/write, retrying..\n");
+			#endif
+		} else if (ret == 0) {
+			#if DEBUG
+                        fprintf(stderr, "Connection closed unexpectedly\n");
+			#endif
+		} else {
+			#if DEBUG
+			printf("mbedtls_ssl_write() failed with error code: %d\n", ret);
+			#endif
+		}
+
+                /* Wait for an amount of time before retrying */
+		if (total_sleep_time < MAX_RETRY_TIME_MS) {
+			usleep(1000 * RETRY_DELAY_MS);
+			total_sleep_time += RETRY_DELAY_MS;
+		} else {
+			printf("\nMax retry time exceeded, aborting.\n");
+			free(buffer);
+			return -1;
+		}
+	}
+	printf("\nFirmware sent to IoT\n");
+	free(buffer);
+	return 1;
+}
+
+void apply_ota(mbedtls_ssl_context *ssl) {
+	if (send_fw(ssl) < 0) {
+		printf("Could not apply OTA\n");
+	}
 }
 
 void check_input_paths() {
@@ -185,12 +236,9 @@ int dice_auth_attest(const char *url, const char *pem) {
 	} else {
 		long http_code = 0;
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-		if (http_code == 200) {
-			printf("HTTP response code is 200: OK\n");
+		printf("\n");
+		if (http_code == 200)
 			ret = DICE_AUTH_SUCCESS;
-		} else {
-			printf("Unexpected HTTP response code: %ld\n", http_code);
-		}
 	}
 
 	/* Cleanup */
@@ -198,6 +246,48 @@ int dice_auth_attest(const char *url, const char *pem) {
 	curl_easy_cleanup(curl);
 
 	return ret;
+}
+
+#define MIN_BYTES_TO_RECEIVE 700
+
+int recv_cert(mbedtls_ssl_context *ssl, unsigned char *buffer, int buf_len) {
+	int bytes_received = 0;
+	int total_sleep_time = 0;
+
+	while (bytes_received < MIN_BYTES_TO_RECEIVE && total_sleep_time < MAX_RETRY_TIME_MS) {
+		int ret = mbedtls_ssl_read(ssl, buffer + bytes_received, buf_len - bytes_received);
+
+		if (ret > 0) {
+			bytes_received += ret;
+			continue;
+		}
+
+		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+			printf("Error: Connection closed before receiving enough data\n");
+			return -1;
+		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+			#if DEBUG
+			printf("Warning: mbedtls_ssl_read() wants read/write, retrying...\n");
+			#endif
+		} else if (ret == 0) {
+			printf("Error: Connection closed unexpectedly\n");
+		} else {
+			#if DEBUG
+			printf("Error: mbedtls_ssl_read() failed with error code: %d\n", ret);
+			#endif
+		}
+
+		usleep(RETRY_DELAY_MS * 1000);
+		total_sleep_time += RETRY_DELAY_MS;
+	}
+
+	if (bytes_received >= MIN_BYTES_TO_RECEIVE) {
+		printf("Success: Received %d bytes\n", bytes_received);
+		return bytes_received;
+	} else {
+		printf("Error: Timeout reached before receiving enough data\n");
+		return -1;
+	}
 }
 
 int main(int argc, char *argv[]) {
@@ -317,13 +407,15 @@ int main(int argc, char *argv[]) {
 
 		/* Read client message */
 		#define BUF_LEN 4096
-		unsigned char client_msg[BUF_LEN] = {0};
+		unsigned char client_msg[BUF_LEN] = { 0 };
+
+		mbedtls_net_set_nonblock(&client_fd);
 
 		printf("About to receive the certificate..\n");
-		int bytes_read = mbedtls_ssl_read(&ssl, client_msg, BUF_LEN - 1);
+		int bytes_read = recv_cert(&ssl, client_msg, BUF_LEN - 1);
 		if (bytes_read > 0) {
 			client_msg[bytes_read] = '\0';
-			
+			printf("Received certificate, %d bytes\n", bytes_read);
 			unsigned char *pem_buf = NULL;
 			size_t pem_len = 0;
 			if (der_to_pem_buffer((const unsigned char *) client_msg,
@@ -331,29 +423,15 @@ int main(int argc, char *argv[]) {
 				fprintf(stderr, "Conversion failed\n");
 				abort();
 			}
-			#if DEBUG
-			printf("DER to PEM:\n%.50s\n", pem_buf);
-			#endif
+#if DEBUG
+			printf("DER to PEM:\n%s\n", pem_buf);
+#endif
 			if (dice_auth_attest(DICE_AUTH_URL, (const char *)pem_buf) == DICE_AUTH_SUCCESS) {
 				printf("Verified device\n");
-
-				int ret = mbedtls_ssl_write(&ssl, SUCCESS_BYTE, 1);
-				if (ret <= 0) {
-					printf("Could not send verification message\n");
-					mbedtls_ssl_close_notify(&ssl);
-					mbedtls_ssl_free(&ssl);
-					mbedtls_net_free(&client_fd);
-					continue;
-				}
-				printf("Device notified, starting sending data..\n");
 				apply_ota(&ssl);
 				printf("`apply_ota()` returned\n");
 			} else {
 				printf("Not verified device\n");
-				int ret = mbedtls_ssl_write(&ssl, FAILURE_BYTE, 1);
-				if (ret <= 0) {
-					printf("Could not notify about auth-failure\n");	
-				}
 				mbedtls_ssl_close_notify(&ssl);
 				mbedtls_ssl_free(&ssl);
 				mbedtls_net_free(&client_fd);
