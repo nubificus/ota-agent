@@ -37,6 +37,13 @@
 #define PORT 4433
 #define DEBUG 0
 
+char **gargv;
+void restart() {
+	for (int fd = 3; fd < sysconf(_SC_OPEN_MAX) - 1; fd++)
+		(void) close(fd);
+	execv("/proc/self/exe", gargv);
+}
+
 char *NEW_FIRMWARE_PATH;
 char *DICE_AUTH_URL;
 char *SERVER_CRT_PATH;
@@ -120,6 +127,13 @@ int send_fw(mbedtls_ssl_context *ssl) {
         int total_sleep_time = 0;
         int bytes_sent = 0;
 
+	uint32_t u32len = (uint32_t) len;
+	int ret = 0;
+	do {
+		ret = mbedtls_ssl_write(ssl, (uint8_t*)&u32len + ret,
+					sizeof(uint32_t) - ret);
+	} while (ret < sizeof(uint32_t));
+
         while (bytes_sent < len) {
                 const unsigned char *read_from = buffer + bytes_sent;
                 int nr_bytes = len - bytes_sent;
@@ -134,22 +148,18 @@ int send_fw(mbedtls_ssl_context *ssl) {
 		}
 
 		/* Handle errors */
-		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-			printf("Connection closed before sending the new firmware\n");
+		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
+			printf("Connection closed before sending the firmware, restarting..\n");
 			free(buffer);
-			return -1;
+			restart();
 		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
 			#if DEBUG
 			fprintf(stderr, "mbedtls_ssl_write() wants read/write, retrying..\n");
 			#endif
-		} else if (ret == 0) {
-			#if DEBUG
-                        fprintf(stderr, "Connection closed unexpectedly\n");
-			#endif
 		} else {
-			#if DEBUG
-			printf("mbedtls_ssl_write() failed with error code: %d\n", ret);
-			#endif
+			printf("mbedtls_ssl_write() failed with error code: %d\n"
+			       "Restarting..\n", ret);
+			restart();
 		}
 
                 /* Wait for an amount of time before retrying */
@@ -157,9 +167,9 @@ int send_fw(mbedtls_ssl_context *ssl) {
 			usleep(1000 * RETRY_DELAY_MS);
 			total_sleep_time += RETRY_DELAY_MS;
 		} else {
-			printf("\nMax retry time exceeded, aborting.\n");
+			printf("\nMax retry time exceeded, restarting...\n");
 			free(buffer);
-			return -1;
+			restart();
 		}
 	}
 	printf("\nFirmware sent to IoT\n");
@@ -262,19 +272,17 @@ int recv_cert(mbedtls_ssl_context *ssl, unsigned char *buffer, int buf_len) {
 			continue;
 		}
 
-		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-			printf("Error: Connection closed before receiving enough data\n");
-			return -1;
+		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
+			printf("Error: Connection closed unexpectedly, restarting..\n");
+			restart();
 		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
 			#if DEBUG
 			printf("Warning: mbedtls_ssl_read() wants read/write, retrying...\n");
 			#endif
-		} else if (ret == 0) {
-			printf("Error: Connection closed unexpectedly\n");
 		} else {
-			#if DEBUG
-			printf("Error: mbedtls_ssl_read() failed with error code: %d\n", ret);
-			#endif
+			printf("Error: mbedtls_ssl_read() failed with error code: %d\n"
+			       "Restarting..\n", ret);
+			restart();
 		}
 
 		usleep(RETRY_DELAY_MS * 1000);
@@ -284,6 +292,9 @@ int recv_cert(mbedtls_ssl_context *ssl, unsigned char *buffer, int buf_len) {
 	if (bytes_received >= MIN_BYTES_TO_RECEIVE) {
 		printf("Success: Received %d bytes\n", bytes_received);
 		return bytes_received;
+	} else if (bytes_received > 0) {
+		printf("Warning: Could not receive the entire certificate, restarting..\n");
+		restart();
 	} else {
 		printf("Error: Timeout reached before receiving enough data\n");
 		return -1;
@@ -291,6 +302,7 @@ int recv_cert(mbedtls_ssl_context *ssl, unsigned char *buffer, int buf_len) {
 }
 
 int main(int argc, char *argv[]) {
+	gargv = argv;
 	int ret;
 	check_input_paths();
 
@@ -375,7 +387,7 @@ int main(int argc, char *argv[]) {
 		if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
 			fprintf(stderr, "Failed to setup SSL: -0x%04X\n", -ret);
 			mbedtls_net_free(&client_fd);
-			continue;
+			exit(1);
 		}
 
 		mbedtls_ssl_set_bio(&ssl, &client_fd, mbedtls_net_send,
@@ -386,7 +398,7 @@ int main(int argc, char *argv[]) {
 			fprintf(stderr, "Failed to perform SSL handshake: -0x%04X\n", -ret);
 			mbedtls_ssl_free(&ssl);
 			mbedtls_net_free(&client_fd);
-			continue;
+			exit(1);
 		}
 
 		printf("TLS connection established\n");
@@ -395,6 +407,7 @@ int main(int argc, char *argv[]) {
 		/* Debug information */
 		printf("Session Cipher Suite: %s\n", mbedtls_ssl_get_ciphersuite(&ssl));
 		printf("Protocol Version: %s\n", mbedtls_ssl_get_version(&ssl));
+
 		const mbedtls_x509_crt *peer_cert = mbedtls_ssl_get_peer_cert(&ssl);
 		if (peer_cert != NULL) {
 			char buf[1024];
