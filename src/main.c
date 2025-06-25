@@ -23,13 +23,9 @@
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
-#include <openssl/x509.h>
-#include <openssl/pem.h>
+#include <esp32_akri.h>
+#include <linux_akri.h>
+#include <der2pem.h>
 
 #define DICE_AUTH_FAIL -1
 #define DICE_AUTH_SUCCESS 0
@@ -37,150 +33,28 @@
 #define PORT 4433
 #define DEBUG 0
 
+#define RETRY_DELAY_MS 500
+#define MAX_RETRY_TIME_MS 20000
+
 char *NEW_FIRMWARE_PATH;
+char *CONTAINER_IMG;
 char *DICE_AUTH_URL;
 char *SERVER_CRT_PATH;
 char *SERVER_KEY_PATH;
 
-int der_to_pem_buffer(const unsigned char *der_buf, size_t der_len, unsigned char **pem_buf, size_t *pem_len) {
-    X509 *cert = NULL;
-    BIO *pem_bio = NULL;
-    BUF_MEM *pem_mem = NULL;
+typedef enum {
+	LINUX = 1,
+	ESP32 = 2
+}ota_type_t;
 
-    const unsigned char *p = der_buf;
-    cert = d2i_X509(NULL, &p, der_len);
-    if (!cert) {
-        fprintf(stderr, "Error reading DER buffer\n");
-        ERR_print_errors_fp(stderr);
-        return 1;
-    }
-
-    pem_bio = BIO_new(BIO_s_mem());
-    if (!pem_bio) {
-        fprintf(stderr, "Error creating BIO for PEM data\n");
-        ERR_print_errors_fp(stderr);
-        X509_free(cert);
-        return 1;
-    }
-
-    if (!PEM_write_bio_X509(pem_bio, cert)) {
-        fprintf(stderr, "Error writing PEM data to BIO\n");
-        ERR_print_errors_fp(stderr);
-        BIO_free(pem_bio);
-        X509_free(cert);
-        return 1;
-    }
-
-    BIO_get_mem_ptr(pem_bio, &pem_mem);
-    *pem_len = pem_mem->length;
-
-    *pem_buf = (unsigned char *)malloc(*pem_len + 1);
-    if (!*pem_buf) {
-        fprintf(stderr, "Error allocating memory for PEM buffer\n");
-        BIO_free(pem_bio);
-        X509_free(cert);
-        return 1;
-    }
-
-    memcpy(*pem_buf, pem_mem->data, *pem_len);
-    (*pem_buf)[*pem_len] = '\0';
-
-    BIO_free(pem_bio);
-    X509_free(cert);
-
-    return 0;
-}
-
-#define RETRY_DELAY_MS 500
-#define MAX_RETRY_TIME_MS 20000
-
-int send_fw(mbedtls_ssl_context *ssl) {
-        printf("Attemting to send the firmware..\n");
-
-	FILE *file = fopen(NEW_FIRMWARE_PATH, "r");
-	if (file == NULL) {
-		perror("Error: File opening failed");
-		exit(0);
-	}
-	fseek(file, 0, SEEK_END);
-	int len = ftell(file);
-	fseek(file, 0, SEEK_SET);
-
-	void *buffer = malloc(len);
-	if (!buffer) {
-		printf("Could not malloc for the firmware image\n");
-		return -1;
-	}
-
-	if (len > fread(buffer, 1, len, file)) {
-		printf("Could not read the firmware file\n");
-		return -1;
-	}
-
-        int total_sleep_time = 0;
-        int bytes_sent = 0;
-
-        while (bytes_sent < len) {
-                const unsigned char *read_from = buffer + bytes_sent;
-                int nr_bytes = len - bytes_sent;
-                int ret = mbedtls_ssl_write(ssl, read_from, nr_bytes);
-
-                if (ret > 0) {
-			bytes_sent += ret;
-			printf("\rSent: %d%%", (int) (100 * (double) bytes_sent / (double) len));
-			fflush(stdout);
-			total_sleep_time = 0;
-			continue;
-		}
-
-		/* Handle errors */
-		if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-			printf("Connection closed before sending the new firmware\n");
-			free(buffer);
-			return -1;
-		} else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-			#if DEBUG
-			fprintf(stderr, "mbedtls_ssl_write() wants read/write, retrying..\n");
-			#endif
-		} else if (ret == 0) {
-			#if DEBUG
-                        fprintf(stderr, "Connection closed unexpectedly\n");
-			#endif
-		} else {
-			#if DEBUG
-			printf("mbedtls_ssl_write() failed with error code: %d\n", ret);
-			#endif
-		}
-
-                /* Wait for an amount of time before retrying */
-		if (total_sleep_time < MAX_RETRY_TIME_MS) {
-			usleep(1000 * RETRY_DELAY_MS);
-			total_sleep_time += RETRY_DELAY_MS;
-		} else {
-			printf("\nMax retry time exceeded, aborting.\n");
-			free(buffer);
-			return -1;
-		}
-	}
-	printf("\nFirmware sent to IoT\n");
-	free(buffer);
-	return 1;
-}
-
-void apply_ota(mbedtls_ssl_context *ssl) {
-	if (send_fw(ssl) < 0) {
-		printf("Could not apply OTA\n");
-	}
-}
+ota_type_t option;
 
 void check_input_paths() {
-	char *upd_fw_path = getenv("NEW_FIRMWARE_PATH");
-	if (upd_fw_path == NULL) {
-		fprintf(stderr, "NEW_FIRMWARE_PATH is not set - Please set the path of the new firmware\n");
-		exit(0);
-	} else {
-		NEW_FIRMWARE_PATH = strdup(upd_fw_path);
-		fprintf(stdout, "Reading new firmware from:          %s\n", NEW_FIRMWARE_PATH);
+	char *container_img = getenv("CONTAINER_IMG");
+	char *new_firmware_path = getenv("NEW_FIRMWARE_PATH");
+	if (!((container_img != NULL) ^ (new_firmware_path != NULL))) {
+		fprintf(stderr, "Either CONTAINER_IMG or NEW_FIRMWARE_PATH should be defined\n");
+		exit(1);
 	}
 
 	char *dice_auth_url = getenv("DICE_AUTH_URL");
@@ -209,6 +83,21 @@ void check_input_paths() {
                 SERVER_KEY_PATH = strdup(srv_key_path);
 		fprintf(stdout, "Reading server's private key from:  %s\n", SERVER_KEY_PATH);
         }
+
+	option = container_img ? LINUX : ESP32;
+	switch (option) {
+	case LINUX:
+		printf("OTA Type: Linux\n");
+		CONTAINER_IMG = container_img;
+		break;
+	case ESP32:
+		printf("OTA Type: ESP32\n");
+		NEW_FIRMWARE_PATH = new_firmware_path;
+		break;
+	default:
+		fprintf(stderr, "Invalid OTA type\n");
+		exit(1);
+	}
 }
 
 int dice_auth_attest(const char *url, const char *pem) {
@@ -428,7 +317,11 @@ int main(int argc, char *argv[]) {
 #endif
 			if (dice_auth_attest(DICE_AUTH_URL, (const char *)pem_buf) == DICE_AUTH_SUCCESS) {
 				printf("Verified device\n");
-				apply_ota(&ssl);
+				if (option == LINUX)
+					apply_linux_ota(&ssl, CONTAINER_IMG);
+				else
+					apply_esp32_ota(&ssl, NEW_FIRMWARE_PATH);
+
 				printf("`apply_ota()` returned\n");
 			} else {
 				printf("Not verified device\n");
